@@ -98,7 +98,7 @@ def haze_removal(original_img, rads = 5):
 '''
 if __name__ == '__main__':
 
-	no_foggy_img = haze_removal("foggy1.jpg")
+	no_foggy_img = haze_removal('/home/xiaoqing/Project_git/night_image_enhance/input.jpg')
 
 	plt.subplot(2,1,1)
 	io.imshow(original_img)
