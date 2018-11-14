@@ -20,9 +20,9 @@ import datetime
 
 import os
 import sys
-from model_structure_ndarray import GaussianModel
+from model_structure import GaussianModel
 
-alpha = 0.1
+alpha = 0.05
 file_path = './input_image/'
 
 def read_image_paths():
@@ -47,29 +47,6 @@ def gaussian_kernel(x,mu,delta):
 	return (1/(np.sqrt(2*3.14159)*delta))*np.exp(-((x-mu)**2)/(2*delta**2))
 
 
-'''delete repeat element using key=(a,b)'''
-def repeated_del(a,b,c):
-	d = zip(a,b)
-	dic = dict(zip(d,c))
-
-	List = np.array(dic.items())	
-	cc = List[:,1]
-	tuples = List[:,0]
-	aa,bb = zip(*tuples)
-	
-	return np.array(aa),np.array(bb),cc
-
-def f1(model):
-	Weight = model.get_value(col = 'weight')  #Weight(width,height,K)
-	temp = np.min(Weight,axis=2)  #normal direction minimum
-	t1 = np.zeros(Weight.shape)
-	for k in range(Weight.shape[2]):
-		t1[:,:,k] = temp
-	position = np.where(Weight==t1) 
-	'''position of individual(p2) with least weight in each pixel(p0,p1)'''
-	p0,p1,p2 = repeated_del(position[0],position[1],position[2])
-	return p0,p1,p2
-
 def individual_sorted(model):
 	Weight = model.get_value(col = 'weight')
 	Delta = model.get_value(col = 'delta')
@@ -90,7 +67,6 @@ def individual_sorted(model):
 		muster[:,:,i] = i+1
 
 	model.set_value(muster,col='rank')
-
 
 
 '''
@@ -129,18 +105,6 @@ def update_weight(model,mask,k):
 	Weight = model.get_value(row=k,col='weight')
 	Weight = np.where(mask==True,(1-alpha)*Weight+1*alpha,(1-alpha)*Weight+0*alpha)
 	model.set_value(Weight,row=k,col='weight')
-
-'''
-def update_mu_delta(model,img_current,mask,k):
-
-	Mu_pre = model.get_value(row=k,col='mu')
-	Delta_pre = model.get_value(row=k,col='delta')
-	rho = alpha*gaussian_kernel(img_current,Mu_pre,Delta_pre)
-	Mu_cur = np.where(mask[k]==True, Mu_pre + (img_current-Mu_pre)*rho,Mu_pre)
-	Delta_cur = np.where(mask[k]==True, Delta_pre + (img_current-Mu_pre)**2 * rho, Delta_pre)
-	model.set_value(Mu_cur,row=k,col='mu')
-	model.set_value(Delta_cur,row=k,col='delta')
-'''
 
 def update_mu_delta(model,img_current,mask,k):
 
@@ -197,7 +161,7 @@ def preset_model(model,f_img):
 	Width,Height,K,Attribute = model.model.shape
 	model.set_value(f_img,row='k1',col='mu')
 	model.set_value(np.ones(f_img.shape),row='k1',col='weight')
-	model.set_value(np.full((Width,Height,K),10),col='delta')
+	model.set_value(np.full((Width,Height,K),15),col='delta')
 
 def run(model,img_paths):
 	for path in img_paths:
@@ -219,3 +183,29 @@ if __name__ == '__main__':
 	model.debug_print(200,100)
 
 	
+
+
+"""
+'''delete repeat element using key=(a,b)'''
+def repeated_del(a,b,c):
+	d = zip(a,b)
+	dic = dict(zip(d,c))
+
+	List = np.array(dic.items())	
+	cc = List[:,1]
+	tuples = List[:,0]
+	aa,bb = zip(*tuples)
+	
+	return np.array(aa),np.array(bb),cc
+
+def f1(model):
+	Weight = model.get_value(col = 'weight')  #Weight(width,height,K)
+	temp = np.min(Weight,axis=2)  #normal direction minimum
+	t1 = np.zeros(Weight.shape)
+	for k in range(Weight.shape[2]):
+		t1[:,:,k] = temp
+	position = np.where(Weight==t1) 
+	'''position of individual(p2) with least weight in each pixel(p0,p1)'''
+	p0,p1,p2 = repeated_del(position[0],position[1],position[2])
+	return p0,p1,p2
+"""
