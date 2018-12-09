@@ -1,42 +1,35 @@
 #!/usr/bin/env python3
 import os
 import cv2
+import random
+import math
 import numpy as np 
 import matplotlib.pyplot as plt 
-from skimage import io, transform
+from skimage import io, transform,exposure
 from pylab import imshow, show
 from pandas import Series,DataFrame
 from time import time
+from numba import autojit, jit, cuda
+from numba import vectorize, float64, int64,float32,int32,uint16,int16, boolean
 from dist_utils import dist_L1_batch, dist_hamming_batch
 import lbsp
-from numba import autojit, jit, cuda
-from numba import vectorize, float64, int64,float32,int32,uint16,boolean
-import random
-import math
-
+from mpl_toolkits.mplot3d import Axes3D
+import scipy.io as sio
 #random.seed(0)
 
-file_path = './test_input/input/'
+file_path = './test_input/input_fall/'
+#file_path = './test_input/input_office/'
+#file_path = './test_input/input_highway/'
+
 
 NUM_SAMPLE = 50
 ATTRIBUTE = 2
-RGB_THRESHOLD = 23
+RGB_THRESHOLD = 30
 HAMMING_THRESHOLD = 4
 MATCH_THRESHOLD = 2
-
-USE_GPU = True
-BLOCKDIM = (32,16)
-GRIDDIM = (32,16)
+CURRENT_FRAME = 0
 
 
-def timer(func):
-    def deco(*args, **kwargs):  
-        start = time()
-        res = func(*args, **kwargs)
-        stop = time()
-        print('function (%s) cost %f seconds' %(func.__name__,stop-start))
-        return res 
-    return deco
 
 def read_image_paths(filePath = file_path )->[str]: 
 	img_names = [x for x in os.listdir(filePath) if x.split('.')[-1] in 'jpg|png']
@@ -53,7 +46,42 @@ def read_one_image(imgPath) -> np.array: #return uint8
 '''
 img_paths = read_image_paths()
 img_height,img_width,img_channel = read_one_image(img_paths[0]).shape
-bg_samples = np.zeros((img_height,img_width,NUM_SAMPLE,ATTRIBUTE),dtype = int)
+bg_samples = np.zeros((img_height,img_width,NUM_SAMPLE,ATTRIBUTE),dtype = np.uint16)
+
+
+USE_GPU = True
+
+BLOCKDIM = (16,8)
+blockspergrid_w = math.ceil(img_width/BLOCKDIM[0])
+blockspergrid_h = math.ceil(img_height/BLOCKDIM[1])
+GRIDDIM = (blockspergrid_w,blockspergrid_h)
+
+# Dmin long term and short term of 2D array
+dist_min_lt_array = np.zeros((img_height,img_width))
+dist_min_st_array = np.zeros((img_height,img_width))
+
+dist_min_normalized = np.zeros((img_height,img_width))
+
+# last mask of 2D array, either forground or background, if bg, then true
+last_mask = np.full((img_height,img_width),True)
+# last lbsp values
+last_lbsp_values = np.zeros((img_height,img_width),dtype=np.uint16)
+# last rgb values, scaled in range (0,255)
+last_rgb_values = np.zeros((img_height,img_width),dtype=np.uint16)
+# learning rate alpha with long term and short term
+LEARNING_RATE_ST = 0.04
+LEARNING_RATE_LT = 0.01
+
+
+
+def timer(func):
+    def deco(*args, **kwargs):  
+        start = time()
+        res = func(*args, **kwargs)
+        stop = time()
+        print('function (%s) cost %f seconds' %(func.__name__,stop-start))
+        return res 
+    return deco
 
 
 def init_bg_samples():
@@ -86,7 +114,6 @@ def compute_LBSP_values(rgb_values_image)->np.array:
 	return lbsp_values
 
 
-#useless
 #@timer
 @jit
 def is_matched_BG_samples(current_image)->np.array:
@@ -102,6 +129,7 @@ def is_matched_BG_samples(current_image)->np.array:
 		mark_lbsp_match = mark_lbsp_match + np.where(dist_hamming_batch(sample_lbsp_values,current_lbsp_values) <= HAMMING_THRESHOLD,1,0)
 	return np.logical_and(np.where(mark_rgb_match>=MATCH_THRESHOLD,True,False),np.where(mark_lbsp_match>=MATCH_THRESHOLD,True,False))
 
+#useless
 @jit(nopython=True)
 def match_one_sample(width,height,current_rgb_value,current_lbsp_value)->bool:
 	match_rgb_times = 0
@@ -134,9 +162,6 @@ def is_matched_BG_samples_compile_optimal(current_image,
 
 #-----------------------------------------------------------------------------------------
 
-Dmin = np.zeros((img_height,img_width))
-alpha = 0.4
-
 
 def  normalization_min_distance(w,h,current_pixel):
 	sample_rgb_values = bg_samples[h,w,:,0]
@@ -157,7 +182,7 @@ def  normalization_min_distance_compile_optimal(w,h,current_pixel):
 	return min_dx
 
 #@timer
-def update_Dmin(current_image):
+def update_D_MIN(current_image):
 	current_rgb_values = compute_RGB_values(current_image)
 	rgb_L1_distances = np.zeros(current_rgb_values.shape)
 	for w in range(img_width):
@@ -165,49 +190,109 @@ def update_Dmin(current_image):
 			rgb_L1_distances[h,w] = normalization_min_distance_compile_optimal(w,h,current_rgb_values[h,w])
 
 	dx = rgb_L1_distances/np.max(rgb_L1_distances)
-	global Dmin
-	Dmin = Dmin*(1 - alpha) + dx*alpha
+	global dist_min_st_array
+	dist_min_st_array = dist_min_st_array*(1 - LEARNING_RATE_ST) + dx*LEARNING_RATE_ST
 
+'''
+	- return values: is matched and minimum normalized distance
+	- in device GPU cannot use dist_utils functions
+'''
 
+#intensity adjustment for min normalized distance dx
+MIN_NORM_DIST_INTENSITY = 2
+#intensity adjustment for Dmin
+DMIN_INTENSITY = 1.0
+
+@jit(nopython=True)
 def  device_normalization_min_distance(samples,current_rgb,current_lbsp):
-
-	min_dx = 1
+	match_rgb_times = 0
+	match_lbsp_times = 0
+	min_rgb_dist = 255
+	min_sum_dist = 255
+	min_lbsp_dist = 16
+	sum_dist = 0
 	for idx in range(NUM_SAMPLE):
-		rgb_dist = abs(samples[idx,0] - current_rgb)
-		
+		# type uint16 must be converted to float
+		rgb_dist = abs(float(samples[idx,0]) - float(current_rgb))
 		lbsp_dist = 0
-		exr = samples[idx,1]+current_lbsp
+		exr = samples[idx,1] ^ current_lbsp
 		for i in range(16):
 			if (exr>>i)&1 == 1:
 				lbsp_dist += 1
-		
-		#dist = (rgb_dist/256 + lbsp_dist/64)/2
-		dist = rgb_dist/256
-		if min_dx > dist:
-			min_dx = dist
-	return min_dx
-	
+
+		if rgb_dist <= RGB_THRESHOLD:
+			match_rgb_times += 1
+			if lbsp_dist <= HAMMING_THRESHOLD:
+				match_lbsp_times += 1
+
+		sum_dist = min((lbsp_dist/4)*(255/16)+rgb_dist, 255)
+		if min_rgb_dist > rgb_dist:
+			min_rgb_dist = rgb_dist
+		if min_lbsp_dist > lbsp_dist:
+			min_lbsp_dist = lbsp_dist
+		if min_sum_dist > sum_dist:
+			min_sum_dist = sum_dist
+	#min_sum_norm_dist = min(1.0, MIN_NORM_DIST_INTENSITY*((sum_dist/256) + (min_lbsp_dist/16)))
+	if match_lbsp_times >= MATCH_THRESHOLD:
+		#background
+		#return True, min(1.0, (min_rgb_dist/256 + min_lbsp_dist/16)/2)
+		return True, min(1.0, MIN_NORM_DIST_INTENSITY*((min_sum_dist/256) + (min_lbsp_dist/16)))
+	else:
+		#forground
+		#return False, min(1.0, MIN_NORM_DIST_INTENSITY*((min_rgb_dist/256) + (min_lbsp_dist/16))) #+ (2-match_lbsp_times)/4(MATCH_THRESHOLD-match_lbsp_times)/MATCH_THRESHOLD
+		return False, min(1.0, MIN_NORM_DIST_INTENSITY*((min_sum_dist/256) + (min_lbsp_dist/16))+(2-match_lbsp_times)/2) #+ (2-match_lbsp_times)/4(MATCH_THRESHOLD-match_lbsp_times)/MATCH_THRESHOLD
+
+
 normalization_min_distance_gpu = cuda.jit(device=True)(device_normalization_min_distance)
+
 @cuda.jit
-def update_Dmin_gpu_kernel(distances,sample_values,current_rgb_values,current_lbsp_values):
+def gpu_kernel_for_D_MIN_and_match(mask,distances,sample_values,current_rgb_values,current_lbsp_values):
 	height = current_rgb_values.shape[0]
 	width = current_rgb_values.shape[1]
-	
-	startX, startY = cuda.grid(2)
-	gridX = cuda.gridDim.x * cuda.blockDim.x;
-	gridY = cuda.gridDim.y * cuda.blockDim.y;
-	for x in range(startX, width, gridX):
-		for y in range(startY, height, gridY): 
-			distances[y,x] = normalization_min_distance_gpu(sample_values[y,x],np.int64(current_rgb_values[y,x]),current_lbsp_values[y,x])
+
+	abs_X,abs_Y = cuda.grid(2)
+
+	if abs_X < width and abs_Y < height:
+			mask[abs_Y,abs_X],distances[abs_Y,abs_X] = normalization_min_distance_gpu(sample_values[abs_Y,abs_X],
+																		np.uint16(current_rgb_values[abs_Y,abs_X]),
+																		current_lbsp_values[abs_Y,abs_X])
 	
 
-#@timer
-def update_Dmin_gpu(current_image,current_rgb_values,current_lbsp_values):
-	dx = np.zeros(current_rgb_values.shape)
-	sample_rgb_values = np.ascontiguousarray(bg_samples[:,:,:,:])
-	update_Dmin_gpu_kernel[GRIDDIM, BLOCKDIM](dx,sample_rgb_values,current_rgb_values,current_lbsp_values)
-	global Dmin
-	Dmin = Dmin*(1 - alpha) + dx*alpha
+@vectorize([int32(int32, int32),
+		int16(int16, int16),
+		float32(float32, float32),
+		float64(float64, float64)])
+def batch_min(a,b):
+	return min(a,b)
+@vectorize([int32(int32, int32),
+		int16(int16, int16),
+		float32(float32, float32),
+		float64(float64, float64)])
+def batch_max(a,b):
+	return max(a,b)
+
+
+def update_D_MIN_and_matching_BG_by_GPU(current_image,current_rgb_values,current_lbsp_values):
+	global dist_min_normalized
+	#normalized_min_dist = np.zeros(current_rgb_values.shape)
+	mask = np.full(current_rgb_values.shape,False)
+	sample_rgb_values = np.ascontiguousarray(bg_samples)
+	gpu_kernel_for_D_MIN_and_match[GRIDDIM, BLOCKDIM](mask,dist_min_normalized,sample_rgb_values,current_rgb_values,current_lbsp_values)
+
+	global dist_min_st_array
+	dist_min_st_array = dist_min_st_array*(1 - LEARNING_RATE_ST) + dist_min_normalized*LEARNING_RATE_ST*DMIN_INTENSITY
+	dist_min_st_array = np.where(dist_min_st_array>1.0,1.0,dist_min_st_array)
+
+	global dist_min_lt_array
+	dist_min_lt_array = dist_min_lt_array*(1 - LEARNING_RATE_LT) + dist_min_normalized*LEARNING_RATE_LT*DMIN_INTENSITY
+	dist_min_lt_array = np.where(dist_min_lt_array>1.0,1.0,dist_min_lt_array)
+	
+	dmin = batch_max(dist_min_lt_array,dist_min_st_array)
+	#save_path = os.path.join('./dmin_image/', path.split('/')[-1])
+	#io.imsave(save_path,dist_min_normalized)
+	#view_dx.append(dx[360,650])
+	#print("D_MIN max:",np.max(D_MIN),"min:",np.min(D_MIN))
+	return mask
 #-----------------------------------------------------------------------------------------
 	
 
@@ -239,7 +324,7 @@ def pixel_updated_probability(t):
 	else:
 		return False
 
-@vectorize([int64(int32),
+@vectorize([int32(int32),
 		int64(int64)])		
 def random_choose_sample(t):
 	return random.randint(0,t-1)
@@ -291,11 +376,12 @@ def update_samples_and_neighboor(bg_samples,
 			if which_sample >= 0:
 				bg_samples[h,w,which_sample,0] = current_image_rgb[h,w]
 				bg_samples[h,w,which_sample,1] = current_image_lbsp[h,w]
+				
 				y,x = random_choose_neighboor(h,w,width,height,time_subsamples[h,w])
 				if w!=x or h!=y :
-					pass
 					bg_samples[y,x,which_sample,0] = current_image_rgb[h,w]
 					bg_samples[y,x,which_sample,1] = current_image_lbsp[h,w]
+				
 
 #@timer
 def update_samples(mask:np.array,
@@ -307,6 +393,102 @@ def update_samples(mask:np.array,
 
 #-----------------------------------------------------------------------------------------
 
+model_Vx = np.ones((img_height,img_width))
+V_INCR = 1.0
+V_DECR = -0.1
+UNSTABLE_REG_THRESHOLD = 0.1
+ACCUMULATE_NUM = 100
+def compute_parameter_Vx(mask):
+
+	global model_Vx, last_mask
+
+	blinks = mask ^ last_mask
+	unstable_reg = np.where(batch_min(dist_min_st_array,dist_min_lt_array)>UNSTABLE_REG_THRESHOLD,True,False)
+	stable_reg = np.logical_not(unstable_reg)
+	unblinks = np.logical_not(blinks)
+	model_Vx += np.where(blinks==True,V_INCR,V_DECR)
+	high_dist_min_normalized_reg = np.where(dist_min_normalized**2>0.5,True,False)
+	model_Vx += np.where(high_dist_min_normalized_reg==True,V_DECR/2,0.0)
+	#model_Vx += np.where(np.logical_and(blinks,unstable_reg)==True,V_INCR,V_DECR) 
+
+	'''
+	model_Vx += np.where(np.logical_and(blinks,unstable_reg)==True,V_INCR,0.0) 
+	#model_Vx += np.where(np.logical_or(blinks,unstable_reg)==False,V_DECR,0.0) 
+	model_Vx += np.where(np.logical_and(blinks,stable_reg)==True,V_DECR/4,0.0) 
+	model_Vx += np.where(np.logical_and(unblinks,unstable_reg)==True,V_DECR/2,0.0) 
+	model_Vx += np.where(np.logical_and(unblinks,stable_reg)==True,V_DECR,0.0) 
+	'''
+
+	model_Vx = np.where(model_Vx<1,1.0,model_Vx) 
+	model_Vx = np.where(model_Vx>100,100.0,model_Vx) 
+	#temp = np.where(blinks==True,0.99,0.0)
+	#save_path = os.path.join('./dmin_image/', path.split('/')[-1])
+	#max_value = np.max(model_Vx)
+	#io.imsave(save_path,dist_min_normalized)
+
+
+model_Rx = np.ones((img_height,img_width))
+
+
+def compute_parameter_Rx():
+	global model_Rx
+	dist_min = batch_min(dist_min_st_array,dist_min_lt_array)
+	#mask = np.where(dist_min_st_array>0.1,True,False)
+	mask = np.where(model_Rx<(1+dist_min*2)**2,True,False)
+	model_Rx += np.where(mask==True,(0.01*(model_Vx-15)),-1/(model_Vx))
+	#model_Rx += np.where(mask==True,model_Vx*0.02,-1/model_Vx)
+
+	model_Rx = np.where(model_Rx<1.0,1.0,model_Rx)
+	model_Rx = np.where(model_Rx>6.0,6.0,model_Rx)
+	#save_path = os.path.join('./dmin_image/', path.split('/')[-1])
+	#temp = (1+dist_min*2)**2
+	#print(np.max(model_Rx)) 
+	#io.imsave(save_path,(model_Rx-1)/5)
+
+# range of T is [2,256]
+model_Tx = np.ones((img_height,img_width))
+
+
+
+def compute_parameter_Tx(mask):
+	global model_Tx,last_mask
+
+	multi = batch_max(dist_min_lt_array,dist_min_st_array)*model_Vx*0.01
+	multi = np.where(multi<0.004,0.004,multi)
+	dev = (model_Vx)/batch_max(dist_min_lt_array,dist_min_st_array)
+
+	model_Tx += np.where(mask==False,0.5/multi,-1*dev)
+	#print(np.max(0.1/multi),np.min(0.1/multi))					
+	#stable_reg = np.where(batch_min(dist_min_st_array,dist_min_lt_array)<UNSTABLE_REG_THRESHOLD,True,False)
+
+	model_Tx = np.where(model_Tx<2,2.0,model_Tx)
+	model_Tx = np.where(model_Tx>256,256.0,model_Tx)
+	#print(np.max(temp),np.min(temp))
+	#save_path = os.path.join('./dmin_image/', path.split('/')[-1])
+	#print(np.max(model_Tx))
+	#io.imsave(save_path,(model_Tx-1)/255)
+	#img_Blur=cv2.blur(model_Vx/50,(3,3))
+	#io.imsave(save_path,temp)
+
+
+def update_parameter(mask,rgb_values,lbsp_values):
+
+	global last_mask,last_rgb_values,last_lbsp_values
+
+	compute_parameter_Vx(mask)
+	compute_parameter_Rx()
+	compute_parameter_Tx(mask)
+
+	last_mask = mask.copy()
+	last_rgb_values = rgb_values.copy()
+	last_lbsp_values = lbsp_values.copy()
+	
+
+
+
+	
+
+#-----------------------------------------------------------------------------------------
 
 def debug_one_pixel_print(h=0,w=0):
 	frame = {"RGB":bg_samples[h,w,:,0],
@@ -314,30 +496,71 @@ def debug_one_pixel_print(h=0,w=0):
 	cell = DataFrame(frame,index=list(range(0,NUM_SAMPLE)))
 	print(cell)
 
-@timer
+
+bg_tree = []
+dy_tree = []
+way = []
+bg_car = []
+
+#@timer
 def ones_iteration(current_image,T_subsamples):
+	global CURRENT_FRAME
+
 	rgb_values  = compute_RGB_values(current_image)
 	lbsp_values = compute_LBSP_values(rgb_values)
-	mask        = is_matched_BG_samples_compile_optimal(current_image,rgb_values,lbsp_values)
+	mask = update_D_MIN_and_matching_BG_by_GPU(current_image,rgb_values,lbsp_values)
 	update_samples(mask,T_subsamples,rgb_values,lbsp_values)
-	update_Dmin_gpu(current_image,rgb_values,lbsp_values)
+	#test = segmentation_image(mask)
+	update_parameter(mask,rgb_values,lbsp_values)
+	'''
+	bg_tree.append(rgb_values[201,156])
+	dy_tree.append(rgb_values[37,471])
+	way.append(rgb_values[417,602])
+	bg_car.append(rgb_values[403,105])
+	'''
+	#return test#mask
+
+
 
 
 if __name__ == '__main__':
 	init_bg_samples()
-	subsamples = np.full((img_height,img_width),5)
-	#pre_rgb_values = np.full((img_height,img_width),0)
-	img = read_one_image(img_paths[0])
-		#ones_iteration(image,subsamples)
-	rgb_value  = compute_RGB_values(img)
-	pre_lbsp_values = compute_LBSP_values(rgb_value)
-	#pre_lbsp_values = np.full((img_height,img_width),0)
+	subsamples = np.full((img_height,img_width),1)
+
 	for path in img_paths:
-		print(path,"-------------------------------------------#")
+		CURRENT_FRAME += 1
+		if CURRENT_FRAME <100:
+			continue
+		print(path,"-----------------------------#")
 		image = read_one_image(path)
+		
 		ones_iteration(image,subsamples)
 
-		dmin_path = os.path.join('./dmin_image/', path.split('/')[-1])
-		io.imsave(dmin_path,lbsp_dist)
-		
-	
+		if CURRENT_FRAME >= 500:
+			break
+		#D_MIN_path = os.path.join('./D_MIN_image/', path.split('/')[-1])
+		#io.imsave(D_MIN_path,dist/16)
+	sio.savemat('model_Vx.mat', {"model_Vx":model_Tx})
+
+#	hist1=np.histogram(model_Vx, bins=100) 
+#	plt.hist(model_Vx.flatten(), bins=100)
+#	plt.show()
+	'''
+	print("bg_tree",bg_samples[201,156,0,0])
+	print("dy_tree",bg_samples[37,471,0,0])
+	print("way",bg_samples[417,602,0,0])
+	print("bg_car",bg_samples[403,105,0,0])
+	plt.figure("background tree")
+	plt.plot(list(range(len(bg_tree))),bg_tree)
+	plt.ylim(0, 255)
+	plt.figure("dynamic tree")
+	plt.plot(list(range(len(dy_tree))),dy_tree)
+	plt.ylim(0, 255)
+	plt.figure("way")
+	plt.plot(list(range(len(way))),way)
+	plt.ylim(0, 255)
+	plt.figure("background car")
+	plt.plot(list(range(len(bg_car))),bg_car)
+	plt.ylim(0, 255)
+	plt.show()
+	'''
