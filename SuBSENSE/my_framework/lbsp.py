@@ -73,8 +73,8 @@ def debug_lbsp_pixel(img,base_x,base_y):
 	- claculating one image`s lbsp values
 	- lbsp values save in parameter values
 '''
-@timer
-def lbsp_image_normal(img,values):
+#@timer
+def compute_lbsp_without_GPU(img,values):
 		(height, width) = img.shape
 		for w in range(width):
 			for h in range(height):
@@ -86,17 +86,28 @@ lbsp_pixel_for_gpu = cuda.jit(device=True)(lbsp_pixel)
 def lbsp_gpu_kernel(img,values):
 	height = img.shape[0]
 	width = img.shape[1]
-
+	abs_X,abs_Y = cuda.grid(2)
+	if abs_X < width and abs_Y < height:
+		values[abs_Y,abs_X] = lbsp_pixel_for_gpu(img,abs_X,abs_Y)
+	'''
 	startX, startY = cuda.grid(2)
 	gridX = cuda.gridDim.x * cuda.blockDim.x;
 	gridY = cuda.gridDim.y * cuda.blockDim.y;
 	for x in range(startX, width, gridX):
 		for y in range(startY, height, gridY): 
+	#x,y = cuda.grid(2)
+	#if x < width and y < height:
 			values[y,x] = lbsp_pixel_for_gpu(img,x,y)
 			#values[y,x] = lbsp_pixel(img,x,y)
+	'''
 
-@timer
-def lbsp_image_gpu(img,values):
+#@timer
+def compute_lbsp_with_GPU(img,values,blockdim,griddim):
+	lbsp_gpu_kernel[griddim, blockdim](img,values)
+
+
+
+def compute_lbsp_gpu(img,values):
 	lbsp_gpu_kernel[GRIDDIM, BLOCKDIM](img,values)
 
 	
@@ -108,8 +119,8 @@ if __name__ == '__main__':
 	image = np.random.randint(1,10,(10,10))
 	lbsp_values = np.zeros(image.shape,dtype=np.uint16)
 
-	#lbsp_image_normal(image,lbsp_values)
-	lbsp_image_gpu(image,lbsp_values)
+	#compute_lbsp_without_GPU(image,lbsp_values)
+	compute_lbsp_with_GPU(image,lbsp_values)
 """
 
 
